@@ -8,3 +8,243 @@ Telemetry threads (3 flights in parallel)
 Login + RBAC (a simple role to permissions map)
 GUI (login, request form, mission table, live telemetry)
 Log files + reports + tests + demo script
+
+
+IN DETAIL PLAN 
+# AeroPath class design (CLI version)
+
+I'm designing this so the CLI is just a thin layer on top. The engine never calls `System.out` directly, so a GUI can replace the CLI later without touching the core.
+
+## 0. Package map
+
+```
+model       → data holders (what things ARE)
+exception   → custom errors
+engine      → scheduling + feasibility + selection (the "decisions")
+graph       → map + Dijkstra + A*
+simulation  → threads
+service     → orchestration (the 12-step flow), auth, maintenance, reports
+data        → loading and saving (CSV now, DB later)
+cli         → menus and input
+```
+
+---
+
+## 1. `model`: enums
+
+| Enum | Values / methods |
+|---|---|
+| `Priority` | `CRITICAL(4), HIGH(3), MEDIUM(2), LOW(1)`, `getWeight()` |
+| `DroneStatus` | `AVAILABLE, ON_MISSION, CHARGING, MAINTENANCE` |
+| `MissionStatus` | `CREATED, DISPATCHED, IN_FLIGHT, DELIVERED, COMPLETED, ABORTED` |
+| `Role` | `ADMIN, DISPATCHER, MEDICAL_OFFICER, DRONE_OPERATOR, MAINTENANCE_STAFF` |
+| `Permission` | `SUBMIT_REQUEST, DISPATCH_MISSION, VIEW_TELEMETRY, CONTROL_TELEMETRY, MANAGE_MAINTENANCE, MANAGE_USERS` |
+| `LocationType` | `BASE, HOSPITAL, CLINIC` |
+
+## 2. `model`: core classes
+
+**`Location`**
+- Fields: `id, name, type, x, y`
+- Methods: getters, `distanceTo(Location other)` (Euclidean)
+
+**`Drone`** *implements `Maintainable`*
+- Fields: `id, model, maxPayloadKg, batteryPct, speedKmph, status, baseLocationId, totalFlightHours, flightsSinceService`
+- Methods:
+  - `canCarry(double kg)`
+  - `setBattery(double)` (validates 0–100)
+  - `setStatus(DroneStatus)`
+  - `drainBattery(double pct)`, `recharge()`
+  - Maintainable: `needsService()`, `performService()`
+
+**`EmergencyRequest`**
+- Fields: `id, itemName, payloadKg, priority, destinationId, submittedAtMillis, submittedBy`
+- Methods: `calculateScore(long nowMillis)` (`W×10⁵ − waiting`), getters, `toString()`
+
+**`Mission`** *implements `Trackable`, `Deliverable`*
+- Fields: `id, request, drone, route (RouteResult), status, distanceTotal, distanceTraveled, startTime, endTime, energyRequired`
+- Methods:
+  - `transitionTo(MissionStatus)` (throws `InvalidMissionException` on an illegal jump)
+  - `advance(double distance)`
+  - `getProgressPercent()`, `getEtaSeconds(speed)`
+  - Trackable: `getTelemetry()` (returns a `TelemetrySnapshot`)
+  - Deliverable: `confirmDelivery()`, `getDeliveryProof()`
+
+**`TelemetrySnapshot`** (use a Java `record`): `missionId, droneId, progressPct, etaSec, batteryPct, status, timestamp`
+
+**`MaintenanceRecord`**: `droneId, date, reason, performedBy, notes`
+
+**`FlightLog`**: `missionId, droneId, from, to, distance, durationSec, batteryUsed, outcome`
+
+## 3. `model`: user hierarchy (inheritance + polymorphism)
+
+**`User`** (abstract)
+- Fields: `username, passwordHash, role`
+- Methods:
+  - `abstract Set<Permission> getPermissions()`
+  - `boolean can(Permission p)`
+  - `abstract void showMenu()` (or `List<String> getMenuOptions()`, which keeps printing out of the model)
+
+Subclasses, each overriding `getPermissions()` and `getMenuOptions()` according to your RBAC matrix:
+- `Admin` (everything)
+- `Dispatcher` (submit, dispatch, full telemetry)
+- `MedicalOfficer` (submit, view telemetry)
+- `DroneOperator` (dispatch, full telemetry)
+- `MaintenanceStaff` (view telemetry, maintenance)
+
+## 4. `model`: interfaces
+
+```java
+interface Trackable    { TelemetrySnapshot getTelemetry(); }
+interface Maintainable { boolean needsService(); void performService(); }
+interface Deliverable  { void confirmDelivery(); String getDeliveryProof(); }
+```
+
+## 5. `exception`
+
+All extend `RuntimeException`: `InsufficientBatteryException`, `PayloadExceededException`, `DroneUnavailableException`, `RouteUnavailableException`, `InvalidMissionException`.
+
+I'd add two small extras: `AuthenticationException` and `AccessDeniedException`.
+
+---
+
+## 6. `engine`
+
+**`Config`**: a final class of constants (`E_BASE, EPSILON, GAMMA, E_RESERVE, ALPHA, BETA, DELTA, PRIORITY_SCALE, TICK_MS`)
+
+**`PriorityScheduler`**
+- Holds a `PriorityQueue<EmergencyRequest>` built with `RequestComparator`
+- `submit(EmergencyRequest)`, `pollNext()`, `peek()`, `size()`, `isEmpty()`, `getPendingList()` (sorted copy, for display)
+
+**`RequestComparator`** *implements `Comparator<EmergencyRequest>`*: `compare(a, b)` using `calculateScore(now)`, higher score first
+
+**`FeasibilityEngine`**
+- `double calculateEnergyRequired(double oneWayKm, double payloadKg)`
+- `void checkPayload(Drone, EmergencyRequest)` (throws `PayloadExceededException`)
+- `void checkEnergy(Drone, double energyRequired)` (throws `InsufficientBatteryException`)
+- `boolean isFeasible(Drone, EmergencyRequest, double oneWayKm)` (the non-throwing version, for filtering)
+
+**`DroneSelector`**
+- `Drone selectBest(List<Drone> fleet, EmergencyRequest req, Graph graph, PathFinder pf)`
+  1. Filter `AVAILABLE`, or throw `DroneUnavailableException`
+  2. Compute each drone's route to the destination and check feasibility
+  3. If none pass, rethrow the most informative exception
+  4. Rank by `S_drone` and return the best
+- `double score(Drone, EmergencyRequest, double distBaseToRequest)`
+
+---
+
+## 7. `graph`
+
+**`Edge`**: `fromId, toId, weight`
+
+**`Graph`**: `Map<String, Location>` plus `Map<String, List<Edge>>`
+- `addLocation(Location)`, `addEdge(from, to, weight, boolean bidirectional)`
+- `getNeighbors(id)`, `getLocation(id)`, `hasNode(id)`, `getAllLocations()`
+
+**`RouteResult`**: `List<String> pathNodeIds, double totalDistance, int nodesExplored, long timeNanos`
+
+**`PathFinder`** (interface): `RouteResult findPath(Graph g, String srcId, String dstId)`. It throws `RouteUnavailableException` if there is no path.
+
+**`DijkstraPathFinder`** and **`AStarPathFinder`** both implement `PathFinder`. This is the strategy pattern, so the mission service can switch algorithms. A private helper `reconstructPath(Map prev, ...)` can live in a shared abstract base class.
+
+---
+
+## 8. `simulation`
+
+**`TelemetryListener`** (interface): `onTick(TelemetrySnapshot)`, `onComplete(Mission)`. The CLI printer implements it, and a GUI later will too.
+
+**`TelemetryTask`** *implements `Runnable`*
+- Fields: `mission, drone, tickSeconds, volatile boolean running, listener`
+- `run()` loop each tick:
+  1. `distance += speed × Δt`
+  2. Update battery
+  3. Compute progress and ETA
+  4. Call `listener.onTick(...)`
+  5. Sleep
+  6. When `distance ≥ total`, set status to `DELIVERED` and call `onComplete`
+- `stop()` (for abort)
+
+**`SimulationManager`**
+- Holds an `ExecutorService` and a `Map<missionId, TelemetryTask>`
+- `startFlight(Mission, Drone, TelemetryListener)`, `abortFlight(missionId)`, `getActiveFlights()`, `shutdown()`
+
+---
+
+## 9. `data`
+
+Starting simple, with interfaces so a DB can slot in later:
+
+- `LocationDAO` → `loadGraph()`
+- `DroneDAO` → `findAll()`, `findById()`, `update(Drone)`
+- `UserDAO` → `findByUsername()`, `findAll()`
+- `MissionLogDAO` → `saveMission(Mission)`, `saveFlightLog(FlightLog)`, `findAll()`
+- `MaintenanceDAO` → `save(MaintenanceRecord)`, `findByDrone(id)`
+- `CsvLoader` (utility): `readLines(path)`, `parseDrone(line)`, etc.
+- File implementations: `CsvLocationDAO`, `CsvDroneDAO`, `CsvUserDAO`, `CsvMissionLogDAO`, `CsvMaintenanceDAO`
+
+## 10. `service`
+
+**`AuthService`**: `login(username, password)`, `logout()`, `getCurrentUser()`, and a `hash(String)` helper
+
+**`AccessControl`**: `check(User, Permission)` throws `AccessDeniedException`
+
+**`MissionService`** (this is your 12-step flow):
+- `submitRequest(User, itemType, destId)`: ingest, validate, score, enqueue
+- `dispatchNext(User)`: poll the queue, find a drone, check feasibility, select, plan route, create the mission, start telemetry
+- `onMissionComplete(Mission)`: confirm delivery, log the flight, update the drone, call `MaintenanceService`
+- `abortMission(User, missionId)`
+- `getActiveMissions()`, `getPendingRequests()`
+- Helpers: `validate(request)`, `planRoute(...)`
+
+**`MaintenanceService`**: `evaluate(Drone)`, `schedule(Drone, reason)`, `completeService(User, droneId)`, `getHistory(droneId)`
+
+**`ReportService`**: `missionSummary()`, `droneUtilisation()`, `maintenanceReport()`
+
+---
+
+## 11. `cli`
+
+- `Main`: wires everything together (creates DAOs, services, loads data, starts `CliApp`)
+- `CliApp`: `start()` → login loop → role menu loop → logout
+- `InputHelper`: `readInt(prompt, min, max)`, `readDouble()`, `readString()`, `readChoice(options)`
+- `ConsolePrinter`: `printTable(...)`, `printDrones(List)`, `printQueue(List)`, `printMission(Mission)`
+- `TelemetryPrinter` *implements `TelemetryListener`*: prints live progress lines
+
+**CLI menu (example for Dispatcher):**
+```
+1. Submit emergency request   4. Abort mission
+2. View pending queue         5. Reports
+3. Dispatch next request      6. Logout
+   (shows live telemetry)
+```
+
+---
+
+## 12. How the pieces connect (one request, end to end)
+
+```
+CLI → MissionService.submitRequest → PriorityScheduler.submit
+CLI → MissionService.dispatchNext
+        → PriorityScheduler.pollNext
+        → DroneSelector.selectBest
+              → FeasibilityEngine (checks)
+              → PathFinder (Dijkstra/A*) on Graph
+        → new Mission(...) → SimulationManager.startFlight
+              → TelemetryTask thread → TelemetryListener (CLI prints)
+        → onMissionComplete → CsvMissionLogDAO + MaintenanceService
+```
+
+## 13. Order to code them (dependency order)
+
+1. Enums, `Location`, `Drone`, `EmergencyRequest`, exceptions
+2. `Config`, `FeasibilityEngine`, `PriorityScheduler` (test with a `main`)
+3. `Edge`, `Graph`, `PathFinder`, `Dijkstra`, `AStar`
+4. `DroneSelector`
+5. `Mission`, `RouteResult`, `TelemetrySnapshot`, `MissionService` (without threads yet)
+6. `TelemetryTask`, `SimulationManager` (plug into `MissionService`)
+7. `User` hierarchy, `AuthService`, `AccessControl`
+8. CSV DAOs, `MaintenanceService`, `ReportService`
+9. CLI classes
+
+That's about 45 classes, though many are small (enums, exceptions, records). The real work is in about 10: `FeasibilityEngine`, `DroneSelector`, `PriorityScheduler`, `Dijkstra`, `AStar`, `Mission`, `TelemetryTask`, `MissionService`, `AuthService`, and `CliApp`.
+
