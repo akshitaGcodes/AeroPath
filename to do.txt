@@ -1,0 +1,10 @@
+Simplified phase list
+Setup + models + enums + exceptions
+CSV loader that reads drones and the map into objects
+Priority queue + feasibility + drone selection (console test)
+Dijkstra + A* (console test)
+Mission service: the full flow in one method (console)
+Telemetry threads (3 flights in parallel)
+Login + RBAC (a simple role to permissions map)
+GUI (login, request form, mission table, live telemetry)
+Log files + reports + tests + demo script
